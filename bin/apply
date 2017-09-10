@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+#
+# Applies this puppet repo to the local node
+#
+
+[[ "$TRACE" ]] && set -o xtrace
+set -o errexit
+set -o nounset
+set -o pipefail
+set -o noclobber
+
+readonly ROOTDIR=$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." && pwd )
+readonly NODEDIR="${ROOTDIR}/nodes"
+
+cd "${ROOTDIR}"
+# Facter appears to fail to pick this up, so set it by hand for now
+export FACTER_serverversion=$(puppet --version)
+
+if [[ "${FACTER_serverversion}" != '5.1.0' ]]; then
+  echo "ERR: expected puppet version 5.1.0, got ${FACTER_serverversion}"
+  exit 1
+fi
+
+puppet apply \
+  --verbose \
+  --modulepath "${ROOTDIR}/modules:${ROOTDIR}/role_modules:${ROOTDIR}/vendor/modules" \
+  --hiera_config "${ROOTDIR}/hiera.yaml" \
+  --logdest console \
+  ${*} \
+  -- "${NODEDIR}"

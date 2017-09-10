@@ -1,0 +1,129 @@
+#!/usr/bin/env ruby
+
+require "optparse"
+require "logger"
+require "time"
+require "open3"
+
+logger = Logger.new("/dev/stderr")
+logger.level = Logger::INFO unless ENV["DEBUG"]
+logger.formatter = -> (level, datetime, _progname, msg) {
+  "#{datetime.utc.iso8601} #{level}: #{msg}\n"
+}
+
+options = {
+  host: nil,
+  jump_host: nil,
+  login: "root",
+  root: File.expand_path("../", __dir__),
+  puppet_dir: "/root/puppet",
+}
+
+OptionParser.new do |o|
+  o.on("-l USER", "--login USER", "User to login into HOST as") do |user|
+    options[:login] = user
+  end
+
+  o.on("-H HOST", "--host HOST", "Host to apply puppet to") do |host|
+    options[:host] = host
+  end
+
+  o.on("-J HOST", "--jump-host HOST", "Jump host to SSH via (user@host)") do |host|
+    options[:jump_host] = host
+  end
+
+  o.on("--no-sync") do |skip_sync|
+    options[:skip_sync] = true
+  end
+
+  o.on("--no-puppet") do |skip_puppet|
+    options[:skip_puppet] = true
+  end
+end.parse!(ARGV)
+
+unless options[:host]
+  puts "ERROR: Host not passed, no idea where to apply puppet"
+  exit 1
+end
+
+def external_command(*command_and_args, &block)
+  # see: http://stackoverflow.com/a/1162850/83386
+  Open3.popen3(*command_and_args) do |_stdin, stdout, stderr, wait_thread|
+    # read each stream from a new thread
+    {:out => stdout, :err => stderr}.each do |key, stream|
+      Thread.new do
+        until (raw_line = stream.gets).nil?
+          print raw_line
+        end
+      end
+    end
+
+    wait_thread.join
+    block.call(wait_thread.value)
+  end
+end
+
+logger.info "Applying to #{options[:host]}"
+
+# Sync appropriate directories across
+rsync_ssh_command = %{ssh }
+rsync_ssh_command << %{ -J #{options[:jump_host]}} if options[:jump_host]
+
+rsync_options = %W(
+  --recursive
+  --copy-links
+  --copy-dirlinks
+  --delete
+  --prune-empty-dirs
+  --one-file-system
+  --no-owner
+  --no-group
+  --verbose
+  --compress
+  --checksum
+  --delete
+  --delete-after
+  --delete-excluded
+  --include .gitkeep
+  --exclude .git/
+  --exclude .git*
+  --exclude spec/
+  -e #{rsync_ssh_command}
+  #{options.fetch(:root)}/puppet/
+  #{options.fetch(:login)}@#{options.fetch(:host)}:#{options.fetch(:puppet_dir)}
+)
+
+unless options[:skip_sync]
+  external_command("rsync", *rsync_options) do |status|
+    case status.exitstatus
+    when 0
+      logger.info "Sync finished"
+    else
+      logger.fatal "Sync exited with code #{status.exitstatus}"
+      exit 1
+    end
+  end
+end
+
+# Apply puppet
+ssh_options = %W(
+  #{options.fetch(:login)}@#{options.fetch(:host)}
+  /root/puppet/bin/apply
+)
+ssh_options.push(*ARGV)
+ssh_options.insert(1, "-J #{options.fetch(:jump_host)}") if options[:jump_host]
+
+unless options[:skip_puppet]
+  external_command("ssh", *ssh_options) do |status|
+    case status.exitstatus
+    when 0
+      # noop, happy
+    else
+      # Uh oh, rsync error
+      logger.fatal "SSH exited with code #{status.exitstatus}"
+      exit 2
+    end
+  end
+end
+
+logger.info "Finished applying to #{options[:host]}"
